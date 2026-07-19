@@ -1,0 +1,133 @@
+# =====================================================================
+# ap_policy.yml — Accounts Payable AI Employee · business configuration
+# ---------------------------------------------------------------------
+# This file is the single control panel for the AI Employee. Anyone on
+# the finance team can edit it in GitHub — no code, no engineer. Every
+# saved change is a logged commit with an author and a timestamp.
+# The Orchestrator reads this file at the start of every run.
+# =====================================================================
+
+meta:
+  policy_version: "1.0.0"
+  company_currency: "MYR"
+  timezone: "Asia/Kuala_Lumpur"
+
+run:
+  batch_source_status: "parked"        # invoices in this status are picked up each run
+  recheck_statuses: ["waiting_gr"]     # also re-checked each run (e.g. goods receipt arrived?)
+  stale_processing_minutes: 30         # a case stuck 'processing' longer than this gets retried
+  max_retries_per_operator: 1          # retry a failed Operator once, then escalate to a human
+  slack_decision_channel: "#ap-approvals"
+  intake_mailbox_folder: "AP-Intake"
+  digest_recipients: ["joshuahaojie@gmail.com"]
+
+normalization:
+  strip_whitespace: true               # trims and collapses double spaces everywhere
+  uppercase_reference_numbers: true    # invoice references compared case-insensitively
+  accepted_date_formats: ["YYYY-MM-DD", "DD.MM.YYYY", "DD/MM/YYYY", "YYYY/MM/DD"]
+  amount_formats:                      # both real-world number styles are valid
+    european_decimal_comma: true       # "327845,70"  means 327845.70
+    thousands_separators: true         # "1,191,636.88" means 1191636.88
+
+duplicates:
+  exact_match_fields: ["vendor", "invoice_reference", "amount"]
+  also_flag_same_reference_different_amount: true   # likely resubmission — a human decides
+  lookback_days: 365
+  action: "escalate"                   # never auto-reject; a person makes the call
+
+matching:                              # 3-way match: invoice vs purchase order vs goods receipt
+  price_tolerance_pct: 2.0             # invoice may exceed expected PO value by this percent...
+  price_tolerance_abs: 50              # ...or this absolute amount, whichever is LARGER
+  qty_tolerance_source: "po_line"      # use each PO line's own over/under tolerance (UEBTO/UNTTO)
+  qty_tolerance_fallback_pct: 5.0      # used when a PO line has no tolerance of its own
+  missing_goods_receipt_action: "wait" # no GR yet -> hold as 'waiting_gr', re-check next run
+                                       # (set to "escalate" to send these to a human instead)
+  po_not_found_action: "escalate"
+  po_vendor_mismatch_action: "escalate"  # invoice vendor differs from the PO's vendor
+  currency_check: "against_po"         # invoice currency must equal the PO currency
+  currency_mismatch_action: "escalate"
+
+risk:
+  bank_change_freeze_days: 14          # vendor changed bank details within N days -> freeze & ask
+  bank_mismatch_action: "escalate"     # bank on invoice != vendor master bank -> freeze & ask
+  blocked_vendor_action: "escalate"    # vendor posting-blocked (SPERR) or flagged deleted (LOEVM)
+  unknown_vendor_action: "escalate"
+  vendor_currency_note_only: true      # invoice vs vendor-master currency difference is a NOTE,
+                                       # not an exception (vendor default currency ≠ billing currency)
+  posting_before_document_date: "note" # BUDAT earlier than BLDAT is recorded, not escalated
+  future_document_date_action: "escalate"
+  large_amount_review_threshold: 1000000   # anything above this always gets a human look
+
+non_po:                                # invoices with no purchase order
+  always_require_human_approval: true  # every non-PO payment is approved by a person in Slack
+  gl_suggestion_order: ["learned_overrides", "gl_master_semantic_match"]
+  min_gl_confidence: "high"            # anything less -> escalate as GL_CODE_UNKNOWN
+  approval_routing: "doa_matrix"       # approver chosen by amount band from the DOA table
+  amount_above_doa_action: "escalate"
+
+approvals:
+  slack_reply_format: "APPROVE <case_id>  or  REJECT <case_id> <reason>"
+  decision_timeout_hours: 12           # no reply -> stays pending, listed in the digest
+  on_timeout: "keep_pending"           # never auto-approve on silence
+  learn_from_decisions: true           # approved GL codings are remembered for that vendor
+
+escalation_reasons:                    # the ONLY allowed reason codes, used everywhere
+  - MISSING_REQUIRED_FIELD
+  - UNPARSEABLE_VALUE
+  - DUPLICATE_INVOICE
+  - VENDOR_UNKNOWN
+  - VENDOR_BLOCKED
+  - PO_NOT_FOUND
+  - PO_VENDOR_MISMATCH
+  - CURRENCY_MISMATCH
+  - WAITING_GOODS_RECEIPT
+  - QTY_OVER_TOLERANCE
+  - PRICE_OVER_TOLERANCE
+  - BANK_DETAILS_MISMATCH
+  - BANK_CHANGE_FREEZE
+  - GL_CODE_UNKNOWN
+  - AMOUNT_ABOVE_DOA
+  - NON_PO_AWAITING_APPROVAL
+  - LARGE_AMOUNT_REVIEW
+  - OPERATOR_FAILED_AFTER_RETRY
+
+money_protected_reasons:               # exceptions whose invoice amount counts as money protected
+  - DUPLICATE_INVOICE
+  - BANK_DETAILS_MISMATCH
+  - BANK_CHANGE_FREEZE
+  - PRICE_OVER_TOLERANCE
+  - QTY_OVER_TOLERANCE
+  - VENDOR_BLOCKED
+  - PO_VENDOR_MISMATCH
+
+templates:
+  slack_approval_card: |
+    :rotating_light: *AP decision needed — case {case_id}*
+    Vendor: {vendor_name} ({lifnr}) · Invoice {xblnr} · {currency} {amount}
+    Reason: {reasons}
+    {plain_english_summary}
+    Reply *APPROVE {case_id}* or *REJECT {case_id} <reason>* in this channel.
+  hubspot_ticket_subject: "AP exception · {reasons} · {vendor_name} · {currency} {amount}"
+  hubspot_ticket_body: |
+    Case {case_id} — invoice {xblnr} from {vendor_name} ({lifnr}), {currency} {amount}.
+    What happened: {plain_english_summary}
+    What the AI Employee did: paused this invoice and asked a human. Nothing was paid.
+    Policy that triggered: {policy_ref}
+    Where to decide: {decision_surface}
+  digest_subject: "AP run {run_id}: {pay_ready} pay-ready · {touchless_rate}% touchless · {currency} {money_protected} protected"
+  digest_body: |
+    AP AI Employee — run {run_id} complete.
+
+    Processed:                {total} invoices
+    Pay-ready automatically:  {pay_ready}   (touchless rate {touchless_rate}%)
+    Waiting on goods receipt: {waiting_gr}
+    Escalated to humans:      {escalated}
+    Awaiting approval:        {awaiting_approval}
+    Money protected:          {currency} {money_protected}
+
+    Exception breakdown: {reason_breakdown}
+    Pending human decisions: {pending_list}
+
+metrics:
+  touchless_rate: "pay_ready with no human touch / total processed x 100"
+  money_protected: "sum of invoice amounts stopped for any reason listed in money_protected_reasons"
